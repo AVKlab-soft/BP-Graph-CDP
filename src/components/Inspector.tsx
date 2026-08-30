@@ -175,14 +175,16 @@ export default function Inspector(p: Props) {
                 />
               </div>
               <div className="mt-2 space-y-1 font-mono text-[10.5px] leading-relaxed">
-                <Row k="мост" v={health.ok ? (health.bridge === "ps" ? "serve.ps1 (PowerShell)" : "server.mjs (Node)") : "не запущен"} tone={health.ok ? "ok" : "err"} />
+                <Row k="канал" v={health.ok ? "узел СБОРКИ (on-line)" : "нет связи"} tone={health.ok ? "ok" : "err"} />
+                <Row k="транспорт Qwen" v={health.pipeName} tone={health.ok ? "ok" : "mut"} />
                 <Row k="Provider_Qwen.ps1" v={health.providerFound ? "найден" : "нет"} tone={health.providerFound ? "ok" : "warn"} />
-                <Row k="браузер Qwen" v="127.0.0.1:9222" tone="mut" />
+                <Row k="Chrome CDP" v="127.0.0.1:9222" tone="mut" />
               </div>
               {!health.ok && (
                 <p className="mt-2 rounded border border-err/25 bg-err/8 px-2.5 py-2 text-[11px] leading-relaxed text-err/90">
-                  Мост не отвечает. Запустите <b className="font-mono">start.bat</b> из корня репозитория — он поднимет мост и найдёт
-                  провайдер автоматически.
+                  Локальный узел не отвечает. Запустите <b className="font-mono">start.bat</b> из корня репозитория — он поднимет узел,
+                  Named Pipe <b className="font-mono">{health.pipeName}</b> и найдёт провайдер автоматически. Промпт и ответ пойдут через
+                  оперативную память, минуя диск и HTTP.
                 </p>
               )}
               {health.ok && (
@@ -286,7 +288,7 @@ export default function Inspector(p: Props) {
             </section>
 
             <p className="mt-auto border-t border-line pt-3 text-[10.5px] leading-relaxed text-dim">
-              Хранение: {p.bridgeMode === "server" ? "data/ на диске (мост запущен)" : "localStorage браузера (локальный режим)"}.
+              Граф хранится в localStorage браузера. Промпты и ответы Qwen не сохраняются — они проходят через Named Pipe в оперативной памяти.
               Двойной клик по холсту — новый узел. Del — удалить выбранное.
             </p>
           </div>

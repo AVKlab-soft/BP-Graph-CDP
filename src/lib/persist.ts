@@ -1,75 +1,39 @@
 import type { WorkspaceDoc } from "../types";
-import { slug } from "../types";
 
 /* ============================================================
-   Хранение: сначала пробуем сервер СБОРКИ (data/<проект>/),
-   если мост не запущен — localStorage (локальный режим).
-   Формат — существующий: workspace.json + <id>.md на узел.
+   Хранение графа — только localStorage браузера.
+   Никаких HTTP/файлов: граф (узлы + связи) — это данные редактора,
+   а не промежуточные промпты/ответы Qwen (те идут через Named Pipe
+   и на диск не попадают).
    ============================================================ */
 
 const LS_KEY = "sborka:workspace";
-const LS_MODE_KEY = "sborka:mode";
 
-export type SaveMode = "server" | "local";
+export type SaveMode = "local";
 
 export interface SaveResult {
   mode: SaveMode;
-  dataPath?: string;
 }
 
 export async function saveDoc(doc: WorkspaceDoc): Promise<SaveResult> {
-  const id = slug(doc.name) + "-" + Math.abs(hashCode(doc.name)).toString(36);
-  const files = [
-    { name: "workspace.json", content: JSON.stringify(doc, null, 2) },
-    ...doc.nodes.map((n) => ({ name: `${n.id}.md`, content: n.content })),
-  ];
   try {
-    const res = await fetch(`/api/projects/${encodeURIComponent(id)}`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json; charset=utf-8" },
-      body: JSON.stringify({ files }),
-    });
-    if (res.ok) {
-      const j = (await res.json()) as { dataPath?: string };
-      localStorage.setItem(LS_MODE_KEY, "server");
-      return { mode: "server", dataPath: j.dataPath };
-    }
-    throw new Error("server");
+    localStorage.setItem(LS_KEY, JSON.stringify({ ...doc, updatedAt: Date.now() }));
   } catch {
-    localStorage.setItem(LS_KEY, JSON.stringify(doc));
-    localStorage.setItem(LS_MODE_KEY, "local");
-    return { mode: "local" };
+    /* квота — молча пропускаем */
   }
+  return { mode: "local" };
 }
 
 export async function loadDoc(): Promise<{ doc: WorkspaceDoc | null; mode: SaveMode }> {
-  try {
-    const res = await fetch("/api/projects");
-    if (res.ok) {
-      const j = (await res.json()) as { projects: { id: string; updatedAt: number }[] };
-      const latest = j.projects[0];
-      if (latest) {
-        const r2 = await fetch(`/api/projects/${encodeURIComponent(latest.id)}`);
-        if (r2.ok) {
-          const doc = (await r2.json()) as WorkspaceDoc;
-          // содержимое нод сервер отдаёт внутри workspace.json (мы его туда пишем)
-          return { doc: normalize(doc), mode: "server" };
-        }
-      }
-      return { doc: null, mode: "server" };
+  const raw = localStorage.getItem(LS_KEY);
+  if (raw) {
+    try {
+      return { doc: normalize(JSON.parse(raw) as WorkspaceDoc), mode: "local" };
+    } catch {
+      /* повреждено — начнём заново */
     }
-    throw new Error("server");
-  } catch {
-    const raw = localStorage.getItem(LS_KEY);
-    if (raw) {
-      try {
-        return { doc: normalize(JSON.parse(raw) as WorkspaceDoc), mode: "local" };
-      } catch {
-        /* повреждено — начнём заново */
-      }
-    }
-    return { doc: null, mode: "local" };
   }
+  return { doc: null, mode: "local" };
 }
 
 function normalize(doc: WorkspaceDoc): WorkspaceDoc {
@@ -79,12 +43,6 @@ function normalize(doc: WorkspaceDoc): WorkspaceDoc {
     nodes: Array.isArray(doc.nodes) ? doc.nodes : [],
     edges: Array.isArray(doc.edges) ? doc.edges : [],
   };
-}
-
-function hashCode(s: string): number {
-  let h = 0;
-  for (let i = 0; i < s.length; i++) h = (Math.imul(31, h) + s.charCodeAt(i)) | 0;
-  return h;
 }
 
 /* ---------- примеры схем (для проверки из ТЗ) ---------- */

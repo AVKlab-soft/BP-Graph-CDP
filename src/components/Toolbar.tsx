@@ -50,7 +50,7 @@ export default function Toolbar(p: Props) {
       {/* сохранение */}
       <div className="flex items-center gap-1.5 font-mono text-[10px] text-dim">
         <IconSave size={13} className={p.saveState === "saved" ? "text-ok" : "text-dim"} />
-        {p.saveState === "saving" ? "сохранение…" : p.saveState === "saved" ? (p.saveMode === "server" ? "data/" : "localStorage") : "—"}
+        {p.saveState === "saving" ? "сохранение…" : p.saveState === "saved" ? "localStorage" : "—"}
       </div>
 
       <div className="ml-auto flex items-center gap-2.5">
@@ -61,13 +61,13 @@ export default function Toolbar(p: Props) {
           }`}
           title={
             p.health.ok
-              ? `Мост: ${p.health.bridge === "ps" ? "serve.ps1" : "server.mjs"} · Provider_Qwen.ps1 ${p.health.providerFound ? "найден" : "НЕ найден"}`
-              : "Мост не запущен — выполните start.bat"
+              ? `Named Pipe: ${p.health.pipeName} · Provider_Qwen.ps1 ${p.health.providerFound ? "найден" : "НЕ найден"} · промпт/ответ — в оперативной памяти`
+              : "Локальный узел не запущен — выполните start.bat"
           }
         >
           <span className={`h-2 w-2 rounded-full ${p.health.ok ? "bg-ok" : "bg-err"}`} />
           <span className={`font-mono text-[10.5px] ${p.health.ok ? "text-ok" : "text-err"}`}>
-            {p.health.ok ? (p.health.providerFound ? "транспорт готов" : "нет провайдера") : "нет моста"}
+            {p.health.ok ? (p.health.providerFound ? "транспорт готов" : "нет провайдера") : "нет узла"}
           </span>
         </div>
 

@@ -3,21 +3,29 @@ import Canvas from "./components/Canvas";
 import Inspector from "./components/Inspector";
 import RunLog from "./components/RunLog";
 import Toolbar from "./components/Toolbar";
-import { runGraph } from "./lib/executor";
 import { indexGraph } from "./lib/graph";
-import { loadDoc, sampleCycle, sampleDiamond, sampleLinear, saveDoc } from "./lib/persist";
-import { fetchHealth, sendToQwen, testQwen } from "./lib/transport";
+import { loadDoc, sampleCycle, sampleDiamond, sampleLinear, saveDoc, type SaveMode } from "./lib/persist";
+import { hostLink, PIPE_NAME, type HostEvent } from "./lib/transport";
 import {
   MAX_STEPS,
   uid,
   type BPNode,
   type HealthInfo,
+  type LinkStatus,
   type LogEntry,
   type LogKind,
   type NodeRunInfo,
   type RunSummary,
   type WorkspaceDoc,
 } from "./types";
+
+const OFF_HEALTH: HealthInfo = {
+  ok: false,
+  link: "off",
+  providerFound: false,
+  pipeName: PIPE_NAME,
+  transport: "Named Pipe → CDP-transport",
+};
 
 interface Toast {
   id: number;
@@ -40,37 +48,35 @@ export default function App() {
   const [log, setLog] = useState<LogEntry[]>([]);
   const [logOpen, setLogOpen] = useState(true);
   const [run, setRun] = useState<RunSummary>({ phase: "idle", steps: 0 });
-  const [health, setHealth] = useState<HealthInfo>({ ok: false, bridge: "none", providerFound: false, transport: "CDP-transport" });
+  const [health, setHealth] = useState<HealthInfo>(OFF_HEALTH);
   const [saveState, setSaveState] = useState<"idle" | "saving" | "saved">("idle");
-  const [saveMode, setSaveMode] = useState<"server" | "local">("local");
+  const [saveMode, setSaveMode] = useState<SaveMode>("local");
   const [testing, setTesting] = useState(false);
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [ready, setReady] = useState(false);
 
-  const abortRef = useRef<AbortController | null>(null);
   const stopFlag = useRef(false);
   const logId = useRef(1);
   const toastId = useRef(1);
   const saveTimer = useRef<number | undefined>(undefined);
   const docRef = useRef(doc);
   docRef.current = doc;
+  const runRef = useRef(run);
+  runRef.current = run;
 
-  /* ---------- загрузка ---------- */
+  /* ---------- загрузка графа ---------- */
   useEffect(() => {
     let alive = true;
     (async () => {
-      const [{ doc: d, mode }, h] = await Promise.all([loadDoc(), fetchHealth()]);
+      const { doc: d, mode } = await loadDoc();
       if (!alive) return;
-      setDoc(d ?? EMPTY);
+      setDoc(d ?? sampleDiamond());
       setSaveMode(mode);
-      setHealth(h);
       setSaveState(d ? "saved" : "idle");
       setReady(true);
     })();
-    const t = window.setInterval(async () => setHealth(await fetchHealth()), 12000);
     return () => {
       alive = false;
-      window.clearInterval(t);
     };
   }, []);
 
@@ -103,6 +109,126 @@ export default function App() {
     }, 650);
     return () => window.clearTimeout(saveTimer.current);
   }, [doc, ready]);
+
+  /* ---------- события локального узла → UI ---------- */
+  const handleEvent = useCallback(
+    (e: HostEvent) => {
+      switch (e.type) {
+        case "hello":
+          setHealth((h) => ({ ...h, ok: true, link: "on", providerFound: e.providerFound, pipeName: e.pipeName, transport: e.transport }));
+          break;
+        case "run-start": {
+          setRunInfo(new Map());
+          setActiveEdges(new Set());
+          setRun({ phase: "running", steps: 0, startedAt: Date.now() });
+          setLogOpen(true);
+          const names = e.roots.map((r) => r.title).join(", ") || "—";
+          pushLog(
+            "sys",
+            `Старт прогона: ${e.totalNodes} узл. Стартовые: ${names}. Сведение ждёт все входы, циклы ограничены ${e.maxSteps} шагами. Промпт/ответ идут через ${PIPE_NAME} → CDP-transport → Qwen.`,
+          );
+          break;
+        }
+        case "node-start": {
+          setRun((r) => ({ ...r, steps: e.step - 1 }));
+          setRunInfo((m) => {
+            const n = new Map(m);
+            const prev = n.get(e.id);
+            n.set(e.id, { status: "running", step: e.step, startedAt: Date.now(), execCount: (prev?.execCount ?? 0) + 1 });
+            return n;
+          });
+          const inc = new Set<string>();
+          docRef.current.edges.forEach((ed) => {
+            if (ed.to === e.id) inc.add(ed.id);
+          });
+          setActiveEdges(inc);
+          pushLog("step", `Узел «${e.title}» исполняется (шаг ${e.step})…`, e.id, e.step);
+          break;
+        }
+        case "prompt":
+          pushLog("prompt", e.prompt, e.id, e.step);
+          break;
+        case "node-done": {
+          setRunInfo((m) => {
+            const n = new Map(m);
+            const prev = n.get(e.id);
+            n.set(e.id, { status: "done", step: e.step, result: e.answer, startedAt: prev?.startedAt, finishedAt: Date.now(), execCount: prev?.execCount ?? 1 });
+            return n;
+          });
+          setActiveEdges(new Set(e.outEdges));
+          window.setTimeout(() => setActiveEdges(new Set()), 1500);
+          pushLog("answer", e.answer, e.id, e.step);
+          pushLog("ok", `«${e.title}» готов за ${(e.elapsedMs / 1000).toFixed(1)} с — результат передан по ${e.outEdges.length} свз.`, e.id, e.step);
+          break;
+        }
+        case "node-error": {
+          setRunInfo((m) => {
+            const n = new Map(m);
+            const prev = n.get(e.id);
+            n.set(e.id, { status: "error", step: e.step, error: e.error, finishedAt: Date.now(), execCount: prev?.execCount ?? 1 });
+            return n;
+          });
+          setActiveEdges(new Set());
+          pushLog("err", e.error, e.id, e.step);
+          break;
+        }
+        case "step-limit":
+          pushLog("err", `Аварийный предел: превышен MAX_STEPS = ${e.maxSteps}. Исполнение остановлено.`);
+          setRun({ phase: "error", steps: e.step, finishedAt: Date.now(), message: `Превышен аварийный предел MAX_STEPS = ${e.maxSteps}` });
+          break;
+        case "done":
+          setActiveEdges(new Set());
+          setRun({ phase: "done", steps: e.steps, finishedAt: Date.now() });
+          pushLog("ok", `Прогон завершён: ${e.steps} шаг(ов). Все результаты — в узлах (правая панель).`);
+          toast("ok", `Готово: ${e.steps} шаг(ов)`);
+          break;
+        case "stopped":
+          setActiveEdges(new Set());
+          setRun({ phase: "stopped", steps: e.steps, finishedAt: Date.now() });
+          pushLog("warn", "Остановлено пользователем. Текущий запрос к Qwen мог дописаться в чат.");
+          toast("info", "Прогон остановлен");
+          break;
+        case "fail":
+          setActiveEdges(new Set());
+          setRun((r) => ({ phase: "error", steps: r.steps, finishedAt: Date.now(), message: e.message }));
+          pushLog("err", e.message);
+          toast("err", "Прогон не завершён — детали в журнале");
+          break;
+        case "test-result":
+          if (e.ok && e.answer) {
+            pushLog("answer", e.answer);
+            pushLog("ok", "Транспорт работает: Qwen ответил через CDP (Named Pipe).");
+            toast("ok", "Qwen ответил — транспорт в порядке");
+          } else {
+            pushLog("err", e.error || "Тест не вернул ответ.");
+            toast("err", e.error || "Тест не прошёл");
+          }
+          setTesting(false);
+          break;
+      }
+    },
+    [pushLog, toast],
+  );
+
+  /* ---------- канал редактор ↔ локальный узел ---------- */
+  useEffect(() => {
+    hostLink.onEvent = handleEvent;
+    hostLink.onStatus = (s: LinkStatus) => {
+      setHealth((h) => ({ ...h, link: s, ok: s === "on" }));
+      if (s === "off" && runRef.current.phase === "running") {
+        setRun((r) => ({ phase: "error", steps: r.steps, finishedAt: Date.now(), message: "Канал с локальным узлом разорван во время прогона." }));
+        pushLog("err", "Канал с локальным узлом разорван.");
+      }
+    };
+    void hostLink.connect();
+    const t = window.setInterval(() => {
+      if (!hostLink.connected) void hostLink.connect();
+    }, 4000);
+    return () => {
+      window.clearInterval(t);
+      hostLink.close();
+    };
+  }, [handleEvent, pushLog]);
 
   /* ---------- правка графа ---------- */
   const patchDoc = useCallback((fn: (d: WorkspaceDoc) => WorkspaceDoc) => setDoc((d) => fn(d)), []);
@@ -187,141 +313,51 @@ export default function App() {
       toast("err", "Граф пуст — нечего исполнять");
       return;
     }
-    const h = await fetchHealth();
-    setHealth(h);
-    if (!h.ok) {
-      pushLog("err", "Мост СБОРКИ не отвечает. Запустите start.bat из корня репозитория.");
-      toast("err", "Мост не запущен — выполните start.bat");
-      return;
+    if (!hostLink.connected) {
+      const ok = await hostLink.connect();
+      if (!ok) {
+        pushLog(
+          "err",
+          `Локальный узел СБОРКИ не отвечает: канал редактора не поднят, Named Pipe ${PIPE_NAME} недоступен. Запустите start.bat из корня репозитория.`,
+        );
+        toast("err", "Узел не запущен — выполните start.bat");
+        return;
+      }
     }
-    if (!h.providerFound) {
-      pushLog("err", "Provider_Qwen.ps1 не найден рядом с мостом. Проверьте папку CDP-transport.");
-      toast("err", "Провайдер Qwen не найден");
-      return;
-    }
-
     stopFlag.current = false;
-    abortRef.current = new AbortController();
-    setRunInfo(new Map());
-    setActiveEdges(new Set());
-    setRun({ phase: "running", steps: 0, startedAt: Date.now() });
     setLogOpen(true);
-    pushLog("sys", `Старт прогона: ${d.nodes.length} узл., ${d.edges.length} свз. Транспорт: ${h.bridge === "ps" ? "serve.ps1" : "server.mjs"} → Provider_Qwen.ps1 → Qwen.`);
-
-    const g = indexGraph(d.nodes, d.edges);
-
-    await runGraph(
-      d,
-      async (prompt) => {
-        const reply = await sendToQwen(prompt, abortRef.current?.signal);
-        if (!reply.ok || !reply.answer) throw new Error(reply.error || "Qwen не вернул ответ (пусто)");
-        return reply.answer;
-      },
-      {
-        isAborted: () => stopFlag.current,
-        onStart: (_total, roots) => {
-          const names = roots.map((id) => d.nodes.find((n) => n.id === id)?.title || id).join(", ");
-          pushLog("sys", `Стартовые узлы: ${names}. Сведение ждёт все входы, циклы ограничены ${MAX_STEPS} шагами.`);
-        },
-        onQueue: () => {},
-        onNodeStart: (id, step) => {
-          setRun((r) => ({ ...r, steps: step - 1 }));
-          setRunInfo((m) => {
-            const n = new Map(m);
-            const prev = n.get(id);
-            n.set(id, { status: "running", step, startedAt: Date.now(), execCount: (prev?.execCount ?? 0) + 1 });
-            return n;
-          });
-          // подсвечиваем входящие рёбра — по ним только что пришли результаты
-          // (узел стартует лишь когда все его источники готовы)
-          const inc = new Set<string>();
-          g.edges.forEach((e) => {
-            if (e.to === id) inc.add(e.id);
-          });
-          setActiveEdges(inc);
-          const title = d.nodes.find((n) => n.id === id)?.title || id;
-          pushLog("step", `Узел «${title}» исполняется (шаг ${step})…`, id, step);
-        },
-        onPrompt: (id, prompt, step) => pushLog("prompt", prompt, id, step),
-        onNodeDone: (id, answer, step, ms) => {
-          setRunInfo((m) => {
-            const n = new Map(m);
-            const prev = n.get(id);
-            n.set(id, { status: "done", step, result: answer, startedAt: prev?.startedAt, finishedAt: Date.now(), execCount: prev?.execCount ?? 1 });
-            return n;
-          });
-          // исходящие рёбра «текут» — результат разошёлся по ветвям
-          const out = new Set<string>();
-          g.edges.forEach((e) => {
-            if (e.from === id) out.add(e.id);
-          });
-          setActiveEdges(out);
-          window.setTimeout(() => setActiveEdges(new Set()), 1500);
-          const title = d.nodes.find((n) => n.id === id)?.title || id;
-          pushLog("answer", answer, id, step);
-          pushLog("ok", `«${title}» готов за ${(ms / 1000).toFixed(1)} с — результат передан по ${out.size} свз.`, id, step);
-        },
-        onNodeError: (id, error, step) => {
-          setRunInfo((m) => {
-            const n = new Map(m);
-            const prev = n.get(id);
-            n.set(id, { status: "error", step, error, finishedAt: Date.now(), execCount: prev?.execCount ?? 1 });
-            return n;
-          });
-          setActiveEdges(new Set());
-          pushLog("err", error, id, step);
-        },
-        onStepLimit: (step) => {
-          pushLog("err", `Аварийный предел: превышен MAX_STEPS = ${MAX_STEPS}. Исполнение остановлено.`);
-          setRun({ phase: "error", steps: step, finishedAt: Date.now(), message: `Превышен аварийный предел MAX_STEPS = ${MAX_STEPS}` });
-        },
-        onDone: (steps) => {
-          setActiveEdges(new Set());
-          setRun({ phase: "done", steps, finishedAt: Date.now() });
-          pushLog("ok", `Прогон завершён: ${steps} шаг(ов). Все результаты — в узлах (правая панель).`);
-          toast("ok", `Готово: ${steps} шаг(ов)`);
-        },
-        onFail: (message) => {
-          setActiveEdges(new Set());
-          setRun((r) => ({ phase: "error", steps: r.steps, finishedAt: Date.now(), message }));
-          pushLog("err", message);
-          toast("err", "Прогон не завершён — детали в журнале");
-        },
-      },
-    );
-
-    if (stopFlag.current) {
-      setRun((r) => ({ phase: "stopped", steps: r.steps, finishedAt: Date.now() }));
-      pushLog("warn", "Остановлено пользователем. Текущий запрос к Qwen мог дописаться в чат.");
-      toast("info", "Прогон остановлен");
+    const sent = hostLink.run({
+      nodes: d.nodes.map((n) => ({ id: n.id, title: n.title, content: n.content })),
+      edges: d.edges.map((e) => ({ id: e.id, from: e.from, to: e.to })),
+      maxSteps: MAX_STEPS,
+    });
+    if (!sent) {
+      pushLog("err", "Не удалось передать граф в локальный узел — канал разорван.");
+      toast("err", "Канал с узлом разорван");
     }
   }, [running, pushLog, toast]);
 
   const stopRun = useCallback(() => {
     stopFlag.current = true;
-    abortRef.current?.abort();
-  }, []);
+    hostLink.stop();
+    pushLog("warn", "Запрошена остановка — узел прервёт прогон после текущего шага.");
+  }, [pushLog]);
 
   /* ---------- тест транспорта ---------- */
   const doTest = useCallback(async () => {
-    setTesting(true);
-    pushLog("sys", "Тест транспорта: провайдер отправит «Напиши одно слово: ТЕСТ.» и сохранит qwen_test_result.txt в data/.");
-    try {
-      const r = await testQwen();
-      if (r.ok && r.answer) {
-        pushLog("answer", r.answer);
-        pushLog("ok", "Транспорт работает: Qwen ответил через CDP.");
-        toast("ok", "Qwen ответил — транспорт в порядке");
-      } else {
-        pushLog("err", r.error || "Тест не вернул ответ.");
-        toast("err", r.error || "Тест не прошёл");
+    if (!hostLink.connected) {
+      const ok = await hostLink.connect();
+      if (!ok) {
+        toast("err", "Узел не запущен — выполните start.bat");
+        return;
       }
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      pushLog("err", `Тест транспорта: ${msg}`);
-      toast("err", msg);
-    } finally {
+    }
+    setTesting(true);
+    pushLog("sys", "Тест транспорта: узел отправит «Напиши одно слово: ТЕСТ.» через Named Pipe в существующий CDP-transport.");
+    if (!hostLink.test()) {
       setTesting(false);
+      pushLog("err", "Не удалось отправить тест в узел — канал разорван.");
+      toast("err", "Канал с узлом разорван");
     }
   }, [pushLog, toast]);
 
