@@ -68,13 +68,17 @@ export interface RunSummary {
 
 /* ---------- транспорт ---------- */
 
-export type BridgeKind = "node" | "ps" | "none";
+/** статус канала редактор ↔ локальный узел (WebSocket) */
+export type LinkStatus = "off" | "connecting" | "on";
 
 export interface HealthInfo {
+  /** узел СБОРКИ отвечает */
   ok: boolean;
-  bridge: BridgeKind;
+  link: LinkStatus;
+  /** Provider_Qwen.ps1 найден узлом рядом с собой */
   providerFound: boolean;
-  providerPath?: string;
+  /** имя Named Pipe, по которому промпт/ответ идут в CDP-transport */
+  pipeName: string;
   transport: string;
 }
 
